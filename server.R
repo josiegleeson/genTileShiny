@@ -1,6 +1,13 @@
 
 library(shiny)
 library(shinyjs)
+library(biomaRt)
+library(GenomicRanges)
+library(BSgenome.Hsapiens.UCSC.hg38)
+# mouse genome
+library(Biostrings)
+library(data.table)
+library(dplyr)
 
 extract_sequences_server <- function(input, output, session) {
   
@@ -13,9 +20,83 @@ extract_sequences_server <- function(input, output, session) {
   
   req(input$user_gene_list)
   
+  # define gene list
+  genes <- fread(input$user_gene_list$datapath, header=F)
+  #genes <- fread("~/Documents/git/genTileShiny/test_genes.txt", header=F)
+  genes <- genes$V1
+  
+  message("Number of genes found: ", length(genes))
+  
+  # use biomaRt to retrieve gene annotations
+  mart <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl")
+  
+  # extract TSS and strand info
+  gene_info <- getBM(
+    attributes = c("hgnc_symbol", "ensembl_gene_id", "ensembl_transcript_id",
+                   "chromosome_name", "transcription_start_site", "strand", "transcript_is_canonical", "transcript_mane_select"),
+    filters = "hgnc_symbol",
+    values = genes,
+    mart = mart
+  )
+  
+  # filter for standard chromosomes only
+  # filter for canonical transcript TSS
+  gene_info_canonical <- gene_info %>%
+    filter(transcript_is_canonical == 1) %>%
+    filter(chromosome_name %in% c(1:22, "X", "Y")) %>%
+    distinct(hgnc_symbol, .keep_all = TRUE)
+  
+  #dist_up_tss <- 1500
+  #dist_down_tss <- 500
+  
+  # define the region around TSS
+  gene_ranges <- with(gene_info_canonical, {
+    GRanges(
+      seqnames = paste0("chr", chromosome_name),
+      ranges = IRanges(
+        start = ifelse(
+          strand == 1,
+          transcription_start_site - dist_up_tss,
+          transcription_start_site - dist_down_tss
+        ),
+        end = ifelse(
+          strand == 1,
+          transcription_start_site + dist_down_tss - 1,
+          transcription_start_site + dist_up_tss -1
+        )
+      ),
+      strand = ifelse(strand == 1, "+", "-"),
+      gene = hgnc_symbol
+    )
+  })
+  
+  # start is >=1
+  start(gene_ranges) <- pmax(1, start(gene_ranges))
+  
+  # get genome
+  genome <- BSgenome.Hsapiens.UCSC.hg38
+  
+  # get sequences
+  seqs <- getSeq(genome, gene_ranges)
+  
+  # make FASTA headers
+  fasta_headers <- paste0(
+    gene_ranges$gene, "::",
+    as.character(seqnames(gene_ranges)), ":",
+    start(gene_ranges), "-",
+    end(gene_ranges), "(",
+    as.character(strand(gene_ranges)), ")"
+  )
+  
+  # name sequences
+  names(seqs) <- fasta_headers
+  
+  # write fasta out
+  writeXStringSet(seqs, filepath = paste0(outdir_guides, "/sequences.fa"))
+  
   # run get sequence script
-  command_get_sequence <- paste0("bin/get_sequence.sh -i ", input$user_gene_list$datapath, " -r references/hg38.fa -u ", input$dist_up_tss, " -d ", input$dist_down_tss, " -o ", outdir_guides, "/sequences.fa -v")
-  system(command_get_sequence)
+  #command_get_sequence <- paste0("bin/get_sequence.sh -i ", input$user_gene_list$datapath, " -r references/hg38.fa -u ", input$dist_up_tss, " -d ", input$dist_down_tss, " -o ", outdir_guides, "/sequences.fa -v")
+  #system(command_get_sequence)
   
 }
 
@@ -66,7 +147,6 @@ select_guides_server <- function(input, output, session) {
     
   }
 }
-
 
 # main shiny app server
 server <- function(input, output, session) {
